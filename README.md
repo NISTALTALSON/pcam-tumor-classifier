@@ -46,6 +46,7 @@ python export.py --checkpoint runs/resnet18/best.pt
 - First run downloads about 7.6 GB of data. `train.py` prints the time of the first epoch and an estimate for the whole run.
 
 ## Colab / Kaggle
+Easiest: open `pcam_train_colab.ipynb` in Colab (File > Upload notebook) and run the cells in order. Manual version:
 Turn on a GPU (Runtime > Change runtime type > T4 GPU), then in a cell:
 ```
 !git clone https://github.com/NISTALTALSON/pcam-tumor-classifier
