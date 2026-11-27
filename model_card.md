@@ -45,7 +45,7 @@ datasets:
 ## Training procedure
 <!--TRAINING-->
 
-Augmentation: random flips, random 90-degree rotations, light color jitter. Decision threshold 0.5 unless stated.
+Decision threshold 0.5 unless stated. No data outside the official PCam train split was used for training; the validation split was used only for early stopping and model choice.
 
 ## Results
 <!--RESULTS-->
@@ -54,6 +54,7 @@ Plots in this repository: `roc_curve.png`, `confusion_matrix.png`, `calibration.
 
 ## Limitations and risks
 - Trained and tested on **one dataset** (Camelyon16-derived, lymph node metastases of breast cancer, from two medical centers). Performance on other hospitals, scanners, stains or cancer types is unknown and may be much worse.
+- Published benchmarks on related data (Camelyon17-WILDS, Koh et al. 2021) show that accuracy can drop sharply when a model is tested on hospitals it never saw in training. Treat any score here as an in-benchmark score only.
 - Patch-level only: a label for a small image, not a slide-level or patient-level result.
 - The label depends only on the center 32x32 region, so the model's task is narrower than "is there cancer in this image".
 - Probabilities can be over- or under-confident; see the calibration results above.

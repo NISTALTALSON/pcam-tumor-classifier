@@ -18,7 +18,7 @@ from torch.utils.data import DataLoader
 from tqdm import tqdm
 
 from common import (DISCLAIMER, MEAN, STD, PCamDataset, eval_transform, get_device, labels_of,
-                    load_model, load_split, safe_auc, seed_everything)
+                    load_model, load_split, safe_auc, seed_everything, tta_logits)
 
 
 def parse_args():
@@ -29,6 +29,7 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=256)
     p.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     p.add_argument("--limit", type=int, default=None, help="evaluate a random subset (code check only, marks results as partial)")
+    p.add_argument("--no-tta", action="store_true", help="turn off test-time augmentation (8 flips/rotations)")
     p.add_argument("--bootstrap", type=int, default=500, help="resamples for 95%% confidence intervals")
     return p.parse_args()
 
@@ -38,11 +39,14 @@ def run_model(model, rows, args, device):
     loader = DataLoader(PCamDataset(rows, eval_transform()), batch_size=args.batch_size, shuffle=False,
                         num_workers=args.workers, pin_memory=device.type == "cuda")
     mean = torch.tensor(MEAN).view(1, 3, 1, 1); std = torch.tensor(STD).view(1, 3, 1, 1)
-    ps, bright = [], []
+    ps, ps_plain, bright = [], [], []
     for x, _ in tqdm(loader, desc="testing"):
         bright.append((x * std + mean).mean(dim=(1, 2, 3)))           # average pixel brightness 0..1
-        ps.append(torch.sigmoid(model(x.to(device)).squeeze(1)).cpu())
-    return torch.cat(ps).numpy(), torch.cat(bright).numpy()
+        xd = x.to(device)
+        plain = torch.sigmoid(model(xd).squeeze(1)).cpu()
+        ps_plain.append(plain)
+        ps.append(torch.sigmoid(tta_logits(model, xd).squeeze(1)).cpu() if args.tta else plain)
+    return torch.cat(ps).numpy(), torch.cat(ps_plain).numpy(), torch.cat(bright).numpy()
 
 
 def basic_metrics(y, p, thr):
@@ -89,6 +93,7 @@ def fmt(v, ci=None):
 
 def main():
     args = parse_args()
+    args.tta = not args.no_tta
     seed_everything(0)
     out = Path(args.out); out.mkdir(parents=True, exist_ok=True)
     device = get_device()
@@ -97,9 +102,10 @@ def main():
     print("Loading the official TEST split (only split this script can touch) ...")
     rows = load_split("test", args.limit, seed=0)
     y = labels_of(rows)
-    p, bright = run_model(model, rows, args, device)
+    p, p_plain, bright = run_model(model, rows, args, device)
     thr = args.threshold
     m = basic_metrics(y, p, thr)
+    m_plain = basic_metrics(y, p_plain, thr) if args.tta else None
     ci = bootstrap_ci(y, p, thr, args.bootstrap)
     ece, cal_rows = calibration(y, p)
     brier = float(brier_score_loss(y, p))
@@ -165,7 +171,7 @@ def main():
     metrics = dict(weights=str(args.weights), arch=cfg["arch"], split="test", n=int(len(y)), n_tumor=int(y.sum()),
                    n_normal=int((1 - y).sum()), threshold=thr, partial=args.limit is not None, metrics=m,
                    ci95=ci, ece=ece, brier=brier, calibration_bins=cal_rows, outcome_groups=groups,
-                   val_tuned_threshold=val_thr, metrics_at_val_tuned_threshold=m_val)
+                   val_tuned_threshold=val_thr, metrics_at_val_tuned_threshold=m_val, tta=args.tta, metrics_without_tta=m_plain)
     (out / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
     np.savetxt(out / "test_predictions.csv", np.c_[np.arange(len(y)), y, p], delimiter=",", header="index,label,prob_tumor", fmt=["%d", "%d", "%.5f"], comments="")
 
@@ -180,6 +186,9 @@ def main():
         L.append(f"| {label} | {fmt(m[k], ci[k])} |")
     L += [f"| Calibration error (ECE, lower is better) | {ece:.4f} |", f"| Brier score (lower is better) | {brier:.4f} |", "",
           f"Confusion matrix: true negatives {m['tn']:,}, false positives {m['fp']:,}, false negatives {m['fn']:,}, true positives {m['tp']:,}.\n"]
+    if m_plain:
+        L.append(f"Test-time augmentation (average over 8 flips/rotations of each patch) is ON for the numbers above. Without it: accuracy {m_plain['accuracy']:.4f}, "
+                 f"sensitivity {m_plain['sensitivity']:.4f}, specificity {m_plain['specificity']:.4f}, ROC-AUC {m_plain['roc_auc']:.4f}.\n")
     if m_val:
         L.append(f"For information only: using the threshold {val_thr:.3f} picked on the validation split gives accuracy {m_val['accuracy']:.4f}, "
                  f"sensitivity {m_val['sensitivity']:.4f}, specificity {m_val['specificity']:.4f}.\n")

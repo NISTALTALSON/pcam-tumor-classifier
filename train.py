@@ -7,6 +7,7 @@ Full run (GPU):                                    python train.py
 """
 import argparse
 import json
+import math
 import os
 import time
 from pathlib import Path
@@ -16,6 +17,7 @@ import torch
 import torch.nn as nn
 from sklearn.metrics import roc_curve
 from torch.utils.data import DataLoader
+from torch.optim.swa_utils import AveragedModel, get_ema_multi_avg_fn
 from tqdm import tqdm
 
 from common import (PCamDataset, build_model, eval_transform, get_device, labels_of,
@@ -27,15 +29,18 @@ def parse_args():
     p.add_argument("--arch", default="resnet18", choices=["resnet18", "efficientnet_b0"])
     p.add_argument("--weights", default="imagenet", choices=["imagenet", "none"],
                    help="'imagenet' = pretrained start, 'none' = train from scratch")
-    p.add_argument("--epochs", type=int, default=12)
+    p.add_argument("--epochs", type=int, default=20)
     p.add_argument("--batch-size", type=int, default=128, help="use 64 if you run out of GPU memory")
     p.add_argument("--lr", type=float, default=3e-4)
     p.add_argument("--weight-decay", type=float, default=1e-4)
-    p.add_argument("--patience", type=int, default=3, help="early stopping: epochs without val-AUC gain")
+    p.add_argument("--patience", type=int, default=4, help="early stopping: epochs without val-AUC gain")
     p.add_argument("--workers", type=int, default=min(4, os.cpu_count() or 1))
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--out", default=None, help="output folder (default runs/<arch>)")
     p.add_argument("--no-amp", action="store_true", help="turn off mixed precision")
+    p.add_argument("--aug", default="strong", choices=["strong", "light"], help="strong = more color/stain jitter + blur")
+    p.add_argument("--ema-decay", type=float, default=0.999, help="weight averaging (EMA); 0 turns it off")
+    p.add_argument("--warmup-epochs", type=float, default=1.0)
     p.add_argument("--resume", action="store_true", help="continue from <out>/last.pt")
     p.add_argument("--allow-cpu", action="store_true", help="allow a full run on CPU (very slow)")
     p.add_argument("--quick-test", action="store_true", help="tiny subset, 2 epochs, just to check the code")
@@ -70,6 +75,7 @@ def main():
     args = parse_args()
     if args.quick_test:
         args.epochs, args.workers, args.batch_size = 2, 0, 64
+        args.ema_decay = 0.9
         n_train, n_val = 2048, 512
     else:
         n_train = n_val = None
@@ -98,13 +104,18 @@ def main():
               persistent_workers=args.workers > 0)
     if args.workers > 0:
         kw["prefetch_factor"] = 4
-    train_loader = DataLoader(PCamDataset(train_rows, train_transform()), batch_size=args.batch_size,
+    train_loader = DataLoader(PCamDataset(train_rows, train_transform(args.aug == "strong")), batch_size=args.batch_size,
                               shuffle=True, drop_last=True, **kw)
     val_loader = DataLoader(PCamDataset(val_rows, eval_transform()), batch_size=256, shuffle=False, **kw)
 
     model = build_model(args.arch, args.weights).to(device).to(memory_format=torch.channels_last)
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
-    sched = torch.optim.lr_scheduler.CosineAnnealingLR(opt, T_max=args.epochs)
+    steps_per_epoch = len(train_loader)
+    total_steps, warm = args.epochs * steps_per_epoch, int(args.warmup_epochs * steps_per_epoch)
+    lr_at = lambda s: (s + 1) / max(1, warm) if s < warm else 0.5 * (1 + math.cos(math.pi * (s - warm) / max(1, total_steps - warm)))
+    sched = torch.optim.lr_scheduler.LambdaLR(opt, lr_at)     # warm-up, then cosine decay to 0, stepped every batch
+    ema = AveragedModel(model, multi_avg_fn=get_ema_multi_avg_fn(args.ema_decay), use_buffers=True) if args.ema_decay > 0 else None
+    eval_model = ema.module if ema is not None else model     # the averaged model is what we validate and save
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
     crit = nn.BCEWithLogitsLoss()
 
@@ -114,6 +125,8 @@ def main():
         s = torch.load(last_path, map_location="cpu", weights_only=True)
         model.load_state_dict(s["model"]); opt.load_state_dict(s["opt"])
         sched.load_state_dict(s["sched"]); scaler.load_state_dict(s["scaler"])
+        if ema is not None and s.get("ema"):
+            ema.load_state_dict(s["ema"])
         start, best_auc, bad, history = s["epoch"] + 1, s["best_auc"], s["bad"], s["history"]
         print(f"Resumed from epoch {start}")
 
@@ -131,11 +144,13 @@ def main():
             scaler.scale(loss).backward()
             scaler.step(opt)
             scaler.update()
+            sched.step()
+            if ema is not None:
+                ema.update_parameters(model)
             run_loss += loss.item() * len(y)
             seen += len(y)
-        sched.step()
 
-        yv, pv = predict_loader(model, val_loader, device, use_amp)
+        yv, pv = predict_loader(eval_model, val_loader, device, use_amp)
         row = dict(epoch=epoch + 1, train_loss=run_loss / seen, val_loss=bce(yv, pv),
                    val_acc=float(((pv >= 0.5) == yv).mean()), val_auc=safe_auc(yv, pv),
                    seconds=time.time() - t0)
@@ -150,12 +165,12 @@ def main():
         improved = row["val_auc"] > best_auc + 1e-4
         if improved:
             best_auc, bad = row["val_auc"], 0
-            torch_save_safe(dict(model=model.state_dict(), arch=args.arch, init_weights=args.weights,
+            torch_save_safe(dict(model=eval_model.state_dict(), arch=args.arch, init_weights=args.weights,
                                  epoch=epoch + 1, val_auc=best_auc), best_path)
         else:
             bad += 1
         torch_save_safe(dict(model=model.state_dict(), opt=opt.state_dict(), sched=sched.state_dict(),
-                             scaler=scaler.state_dict(), epoch=epoch, best_auc=best_auc, bad=bad,
+                             scaler=scaler.state_dict(), ema=ema.state_dict() if ema is not None else None, epoch=epoch, best_auc=best_auc, bad=bad,
                              history=history), last_path)
         if bad >= args.patience:
             print(f"Early stopping: no validation-AUC gain for {args.patience} epochs.")

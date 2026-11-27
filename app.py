@@ -17,6 +17,7 @@ if WEIGHTS is None:
     raise SystemExit("model.safetensors not found. Run export.py first (or put it next to app.py).")
 MODEL, CFG = load_model(WEIGHTS, "cpu")
 THRESHOLD = float(CFG.get("threshold_default", 0.5))
+TTA = bool(CFG.get("tta", True))
 
 BANNER = f"## Research and education only - not for medical diagnosis\n**{DISCLAIMER}**"
 
@@ -28,7 +29,7 @@ def classify(img):
     if img.size != (IMG_SIZE, IMG_SIZE):
         note = (f"\n\nYour image is {img.size[0]}x{img.size[1]} and was resized to {IMG_SIZE}x{IMG_SIZE}. "
                 "The model was trained on real 96x96 patches, so treat this result as unreliable.")
-    p = predict_prob(MODEL, img)
+    p = predict_prob(MODEL, img, TTA)
     verdict = "Tumor tissue likely in the center region" if p >= THRESHOLD else "Normal tissue likely"
     text = (f"### {verdict}\nTumor probability: **{p:.1%}** (decision threshold {THRESHOLD:g}).{note}\n\n"
             "**Reminder: this is a research demo trained on one dataset (PatchCamelyon). "

@@ -63,3 +63,17 @@ Only measured results are reported. Do not tune anything on the test split. See 
 
 ## License
 Code and weights MIT. Dataset CC0 1.0. Citations: Veeling et al. 2018 (PCam); Ehteshami Bejnordi et al. 2017 (Camelyon16).
+
+## Getting the best results (what is in the recipe, and what is not)
+Used, all with the official PCam splits only:
+- Pretrained start (or `--weights none`), strong color/stain augmentation, flips and 90-degree turns
+- Weight averaging (EMA), learning-rate warm-up plus cosine decay, up to 20 epochs with early stopping on validation AUC
+- Test-time augmentation (average over 8 flips/rotations) in `evaluate.py`, `predict.py` and the demo. The test table also shows the numbers without it.
+- Two architectures compared by **validation** AUC (`compare_runs.py`), and only the winner is evaluated on the test split
+
+Deliberately not used:
+- **More training data.** The official PCam train split is everything allowed under the official splits. Mixing in Camelyon17-WILDS (CC0, about 456k patches, five hospitals) could help with other hospitals, but its slides come from a different release and there is no slide-ID list to prove it does not overlap the PCam test slides. Leaking test slides would make the published numbers look better than they are. If you ever try it, do it as a separate, clearly labeled experiment.
+- **Training on the validation split.** It is needed for honest early stopping and model choice.
+- **Tuning anything on the test split.** The test split is looked at once, at the end.
+
+Expect the validation score to be a bit higher than the test score. That gap is common on PCam and is not a bug.

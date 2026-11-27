@@ -44,7 +44,7 @@ def main():
     rel = Path(a.release); rel.mkdir(parents=True, exist_ok=True)
     save_file({k: v.contiguous() for k, v in model.state_dict().items()}, str(rel / "model.safetensors"), metadata={"format": "pt"})
     config = dict(arch=cfg["arch"], img_size=IMG_SIZE, mean=list(MEAN), std=list(STD), num_logits=1,
-                  labels={"0": "normal", "1": "tumor (center 32x32 contains tumor)"}, threshold_default=0.5,
+                  labels={"0": "normal", "1": "tumor (center 32x32 contains tumor)"}, threshold_default=0.5, tta=bool(metrics.get("tta", False)) if metrics else False,
                   threshold_val_tuned=ck.get("val_threshold"), init_weights=ck.get("init_weights"),
                   dataset=DATASET_ID, disclaimer=DISCLAIMER)
     (rel / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
@@ -77,6 +77,7 @@ def main():
         training = (f"- Architecture: {cfg['arch']} (single-logit head), start weights: {ck.get('init_weights')}\n"
                     f"- Epochs run: {s['epochs_run']} (best epoch {s['best_epoch']}, validation ROC-AUC {s['best_val_auc']:.4f}); early stopping on validation AUC\n"
                     f"- Optimizer AdamW, lr {s['args']['lr']}, weight decay {s['args']['weight_decay']}, batch size {s['args']['batch_size']}, mixed precision, seed {s['args']['seed']}\n"
+                    f"- Augmentation: {s['args'].get('aug', 'light')} color/stain jitter + flips + 90-degree turns; weight averaging (EMA) decay {s['args'].get('ema_decay', 0)}; LR warm-up then cosine decay; test-time augmentation: {'on' if config['tta'] else 'off'}\n"
                     f"- Train/validation patches: {s['n_train']:,} / {s['n_val']:,}; hardware: {s['device']}; training time {s['train_minutes']:.0f} min")
     else:
         training = "Training summary not found."
